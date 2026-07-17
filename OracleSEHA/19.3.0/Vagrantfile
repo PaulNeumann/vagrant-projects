@@ -1,0 +1,504 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#------------------------------------------------------------------------------
+# LICENSE UPL 1.0
+# Copyright (c) 1982-2026 Oracle and/or its affiliates. All rights reserved.
+#
+# Vagrantfile
+#   Provisions a two-node Oracle Real Application Clusters (RAC) lab with
+#   Oracle Database 19c (19.3.0) Grid Infrastructure and RDBMS on Oracle
+#   Linux 7.
+#
+#   Supports both VirtualBox and KVM/libvirt providers.
+#
+#   Author: Ruggero Citton <ruggero.citton@oracle.com>
+#           RAC Pack, Cloud Innovation and Solution Engineering Team
+#------------------------------------------------------------------------------
+
+require 'yaml'
+require 'ipaddr'
+
+VAGRANTFILE_API_VERSION = "2"
+
+# ----------------------------- Project identity ------------------------------
+PROJECT_TITLE   = 'Oracle SEHA — Oracle Database 19c on Oracle Linux 7'
+BOX_NAME        = 'oraclelinux/7'
+BOX_URL         = 'https://oracle.github.io/vagrant-projects/boxes/oraclelinux/7.json'
+BOX_MIN_VERSION = '>= 7.8.142'
+
+# Each installer filename must start with this prefix. Prevents accidentally
+# pointing the 19c project at a 21c/23ai zip.
+EXPECTED_GI_SOFTWARE_PREFIX = 'LINUX.X64_193'
+EXPECTED_DB_SOFTWARE_PREFIX = 'LINUX.X64_193'
+
+# Canonical version identifiers (drive ORACLE_HOME paths, preinstall package
+# selection, etc.). Kept as constants so they cannot be overridden by the YAML.
+GI_VERSION = '19.3.0.0'
+DB_VERSION = '19.3.0.0'
+DB_MAJOR   = '19'
+NOMGMTDB   = true
+ORESTART   = false
+
+# --------------------------- Banner ------------------------------------------
+puts ""
+puts "---------------------------------------------------------------"
+puts "  #{PROJECT_TITLE}"
+puts "  Vagrant project for VirtualBox or KVM/libvirt"
+puts "  Copyright (c) 2020-2026 Oracle and/or its affiliates"
+puts "---------------------------------------------------------------"
+puts ""
+
+# --------------------------- Helpers -----------------------------------------
+def fatal(msg)
+  warn "ERROR: #{msg}"
+  exit 1
+end
+
+def valid_ip?(str)
+  !!IPAddr.new(str.to_s) rescue false
+end
+
+def fetch_required(hash, *path)
+  node = hash
+  path.each do |key|
+    unless node.is_a?(Hash) && node.key?(key)
+      fatal "missing required config key: #{path.map(&:to_s).join('.')}"
+    end
+    node = node[key]
+  end
+  fatal "config key #{path.map(&:to_s).join('.')} is empty" if node.nil? || node.to_s.strip.empty?
+  node
+end
+
+def fetch_optional(hash, *path, default: nil)
+  node = hash
+  path.each do |key|
+    return default unless node.is_a?(Hash) && node.key?(key)
+    node = node[key]
+  end
+  node.nil? ? default : node
+end
+
+def verify_checksum_entry(checksum_path, installer)
+  return false unless File.exist?(checksum_path)
+
+  File.foreach(checksum_path) do |line|
+    line = line.strip
+    next if line.empty? || line.start_with?('#')
+
+    parts = line.split(/\s+/, 3)
+    next unless parts.length == 3
+    return true if File.basename(parts[2]) == installer
+  end
+  false
+end
+
+# --------------------------- Config load -------------------------------------
+config_path = File.expand_path('config/vagrant.yml', __dir__)
+fatal "config file not found: #{config_path}" unless File.exist?(config_path)
+
+begin
+  params = YAML.load_file(config_path)
+rescue => e
+  fatal "failed to parse #{config_path}: #{e.message}"
+end
+
+# --------------------------- Extract config ----------------------------------
+var_provider_name   = fetch_required(params, 'env',  'provider')
+var_prefix_name     = fetch_required(params, 'env',  'prefix_name')
+var_domain          = fetch_required(params, 'env',  'domain')
+
+var_scan_ip1        = fetch_required(params, 'env',  'scan_ip1')
+var_scan_ip2        = fetch_required(params, 'env',  'scan_ip2')
+var_scan_ip3        = fetch_required(params, 'env',  'scan_ip3')
+
+var_vm1_name        = fetch_required(params, 'host1', 'vm_name')
+var_vm1_mem_size    = fetch_required(params, 'host1', 'mem_size').to_i
+var_vm1_cpus        = fetch_required(params, 'host1', 'cpus').to_i
+var_vm1_public_ip   = fetch_required(params, 'host1', 'public_ip')
+var_vm1_vip_ip      = fetch_required(params, 'host1', 'vip_ip')
+var_vm1_private_ip  = fetch_required(params, 'host1', 'private_ip')
+
+var_vm2_name        = fetch_required(params, 'host2', 'vm_name')
+var_vm2_mem_size    = fetch_required(params, 'host2', 'mem_size').to_i
+var_vm2_cpus        = fetch_required(params, 'host2', 'cpus').to_i
+var_vm2_public_ip   = fetch_required(params, 'host2', 'public_ip')
+var_vm2_vip_ip      = fetch_required(params, 'host2', 'vip_ip')
+var_vm2_private_ip  = fetch_required(params, 'host2', 'private_ip')
+
+var_asm_disk_num    = fetch_required(params, 'env', 'asm_disk_num').to_i
+var_asm_disk_size   = fetch_required(params, 'env', 'asm_disk_size').to_i
+var_p1_ratio        = fetch_required(params, 'env', 'p1_ratio').to_i
+var_gi_software     = fetch_required(params, 'env', 'gi_software')
+var_db_software     = fetch_required(params, 'env', 'db_software')
+var_opatch_software = fetch_required(params, 'env', 'opatch_software')
+var_gi_ru_software  = fetch_required(params, 'env', 'gi_ru_software')
+var_ora_languages   = fetch_required(params, 'env', 'ora_languages')
+
+# Passwords can be overridden from the environment for CI/test use.
+var_root_password   = ENV.fetch('ORACLE_RAC_ROOT_PASSWORD',   fetch_required(params, 'env', 'root_password'))
+var_grid_password   = ENV.fetch('ORACLE_RAC_GRID_PASSWORD',   fetch_required(params, 'env', 'grid_password'))
+var_oracle_password = ENV.fetch('ORACLE_RAC_ORACLE_PASSWORD', fetch_required(params, 'env', 'oracle_password'))
+var_sys_password    = ENV.fetch('ORACLE_RAC_SYS_PASSWORD',    fetch_required(params, 'env', 'sys_password'))
+var_pdb_password    = ENV.fetch('ORACLE_RAC_PDB_PASSWORD',    fetch_optional(params, 'env', 'pdb_password', default: ''))
+
+var_db_name         = fetch_required(params, 'env', 'db_name')
+var_pdb_name        = fetch_optional(params, 'env', 'pdb_name', default: '')
+var_cdb             = fetch_required(params, 'env', 'cdb')
+
+unless fetch_optional(params, 'env', 'nomgmtdb', default: nil).nil?
+  fatal "'env.nomgmtdb' is not supported in SEHA; remove the key"
+end
+
+unless fetch_optional(params, 'env', 'orestart', default: nil).nil?
+  fatal "'env.orestart' is not supported in SEHA; remove the key"
+end
+
+unless fetch_optional(params, 'env', 'db_type', default: nil).nil?
+  fatal "'env.db_type' is not supported in SEHA; remove the key"
+end
+
+# --------------------------- Validation --------------------------------------
+unless %w[libvirt virtualbox].include?(var_provider_name)
+  fatal "'env.provider' must be 'libvirt' or 'virtualbox' (got: '#{var_provider_name}')"
+end
+
+unless var_prefix_name.match?(/\A[0-9a-zA-Z-]{1,14}\z/)
+  fatal "'env.prefix_name' must be 1-14 chars of [0-9a-zA-Z-] (got: '#{var_prefix_name}')"
+end
+
+fatal "'host1.mem_size' must be >= 6144 MB (got: #{var_vm1_mem_size})" if var_vm1_mem_size < 6144
+fatal "'host2.mem_size' must be >= 6144 MB (got: #{var_vm2_mem_size})" if var_vm2_mem_size < 6144
+fatal "'host1.cpus' must be >= 1 (got: #{var_vm1_cpus})"               if var_vm1_cpus    < 1
+fatal "'host2.cpus' must be >= 1 (got: #{var_vm2_cpus})"               if var_vm2_cpus    < 1
+
+[true, false].include?(var_cdb)      || fatal("'env.cdb' must be true or false (got: #{var_cdb.inspect})")
+
+fatal "'env.p1_ratio' must be between 10 and 80 (got: #{var_p1_ratio})"  unless (10..80).cover?(var_p1_ratio)
+fatal "'env.asm_disk_num' must be >= 4 (got: #{var_asm_disk_num})"       if var_asm_disk_num  < 4
+fatal "'env.asm_disk_size' must be >= 10 GB (got: #{var_asm_disk_size})" if var_asm_disk_size < 10
+
+ip_fields = {
+  'host1.public_ip'  => var_vm1_public_ip,
+  'host1.private_ip' => var_vm1_private_ip,
+  'host1.vip_ip'     => var_vm1_vip_ip,
+  'env.scan_ip1'     => var_scan_ip1,
+  'env.scan_ip2'     => var_scan_ip2,
+  'env.scan_ip3'     => var_scan_ip3,
+}
+unless ORESTART == true
+  ip_fields['host2.public_ip']  = var_vm2_public_ip
+  ip_fields['host2.private_ip'] = var_vm2_private_ip
+  ip_fields['host2.vip_ip']     = var_vm2_vip_ip
+end
+ip_fields.each do |label, val|
+  fatal "#{label} is not a valid IP address (got: '#{val}')" unless valid_ip?(val)
+end
+
+if var_cdb == true
+  fatal "'env.pdb_name' is required when cdb=true"     if var_pdb_name.to_s.empty?
+  fatal "'env.pdb_password' is required when cdb=true" if var_pdb_password.to_s.empty?
+end
+
+# Installer presence + filename prefix + checksum manifest entry
+gi_zip_path = File.expand_path("./ORCL_software/#{var_gi_software}", __dir__)
+db_zip_path = File.expand_path("./ORCL_software/#{var_db_software}", __dir__)
+opatch_zip_path = File.expand_path("./ORCL_software/#{var_opatch_software}", __dir__)
+gi_ru_zip_path = File.expand_path("./ORCL_software/#{var_gi_ru_software}", __dir__)
+fatal "GI installer zip not found: #{gi_zip_path}\n  Place the Oracle 19c Grid Infrastructure zip into ORCL_software/." unless File.exist?(gi_zip_path)
+fatal "DB installer zip not found: #{db_zip_path}\n  Place the Oracle 19c Database zip into ORCL_software/."            unless File.exist?(db_zip_path)
+fatal "19c OPatch zip not found: #{opatch_zip_path}\n  Place p6880880_190000_Linux-x86-64.zip into ORCL_software/." unless File.exist?(opatch_zip_path)
+fatal "19c GI RU zip not found: #{gi_ru_zip_path}\n  Place the 19.7-or-newer Grid Infrastructure RU zip into ORCL_software/. It is a combo patch and also carries the RDBMS home patch, so no separate Database RU is needed." unless File.exist?(gi_ru_zip_path)
+
+unless var_gi_software.start_with?(EXPECTED_GI_SOFTWARE_PREFIX)
+  fatal "'env.gi_software' (#{var_gi_software}) does not match this project (expected prefix: #{EXPECTED_GI_SOFTWARE_PREFIX})"
+end
+unless var_db_software.start_with?(EXPECTED_DB_SOFTWARE_PREFIX)
+  fatal "'env.db_software' (#{var_db_software}) does not match this project (expected prefix: #{EXPECTED_DB_SOFTWARE_PREFIX})"
+end
+unless var_gi_ru_software.match?(/\Ap[0-9]+_190000_[A-Za-z0-9_-]+\.zip\z/)
+  fatal "'env.gi_ru_software' must be a 19c Grid Infrastructure RU zip named p<bug>_190000_<platform>.zip (got: #{var_gi_ru_software})"
+end
+unless var_opatch_software == 'p6880880_190000_Linux-x86-64.zip'
+  fatal "'env.opatch_software' must be p6880880_190000_Linux-x86-64.zip (got: #{var_opatch_software})"
+end
+
+checksum_path = File.expand_path('./db_installer.cksum', __dir__)
+fatal "installer checksum file not found: #{checksum_path}" unless File.exist?(checksum_path)
+fatal "no checksum entry for '#{var_gi_software}' found in #{checksum_path}\n  Run:  cksum ORCL_software/#{var_gi_software}  and paste the result." unless verify_checksum_entry(checksum_path, var_gi_software)
+fatal "no checksum entry for '#{var_db_software}' found in #{checksum_path}\n  Run:  cksum ORCL_software/#{var_db_software}  and paste the result." unless verify_checksum_entry(checksum_path, var_db_software)
+fatal "no checksum entry for '#{var_opatch_software}' found in #{checksum_path}\n  Run:  cksum ORCL_software/#{var_opatch_software}  and paste the result." unless verify_checksum_entry(checksum_path, var_opatch_software)
+fatal "no checksum entry for '#{var_gi_ru_software}' found in #{checksum_path}\n  Run:  cksum ORCL_software/#{var_gi_ru_software}  and paste the result." unless verify_checksum_entry(checksum_path, var_gi_ru_software)
+
+# --------------------------- Provider setup ----------------------------------
+provider = var_provider_name.to_sym
+puts "Provider: #{provider}"
+puts ""
+
+box_disks_num = 1
+ENV['VAGRANT_NO_PARALLEL'] = 'yes'
+
+begin
+  boxes_out = `vagrant box list 2>/dev/null`
+  have_box  = boxes_out.lines.any? { |l| l.include?("#{BOX_NAME} (#{var_provider_name},") }
+  unless have_box
+    puts "NOTE: '#{BOX_NAME}' is not cached for provider '#{var_provider_name}'."
+    puts "      Vagrant will download it now; expect a multi-GB transfer from yum.oracle.com."
+    puts "      To pre-download (interactive progress), run in another shell:"
+    puts "        vagrant box add #{BOX_NAME} #{BOX_URL} --provider=#{var_provider_name}"
+    puts ""
+  end
+rescue StandardError
+  # Best-effort notice; never block on failure.
+end
+
+# --------------------------- Storage setup -----------------------------------
+if var_provider_name == 'libvirt'
+  var_vm1_storage     = fetch_optional(params, 'host1', 'storage_pool_name', default: 'default')
+  var_vm2_storage     = fetch_optional(params, 'host2', 'storage_pool_name', default: 'default')
+  var_asm_storage     = fetch_optional(params, 'env',   'storage_pool_name', default: 'default')
+  var_vm1_storage = 'default' if var_vm1_storage.to_s.empty?
+  var_vm2_storage = 'default' if var_vm2_storage.to_s.empty?
+  var_asm_storage = 'default' if var_asm_storage.to_s.empty?
+end
+
+if var_provider_name == 'virtualbox'
+  var_group          = fetch_optional(params, 'env',   'virtualbox_group', default: nil)
+  var_vm1_u01_disk   = fetch_optional(params, 'host1', 'u01_disk',       default: './node1_u01.vdi')
+  var_vm2_u01_disk   = fetch_optional(params, 'host2', 'u01_disk',       default: './node2_u01.vdi')
+  var_non_rotational = fetch_optional(params, 'env',   'non_rotational', default: 'on')
+  var_asm_disk_path  = fetch_optional(params, 'env',   'asm_disk_path',  default: '')
+
+  unless %w[on off].include?(var_non_rotational)
+    fatal "'env.non_rotational' must be 'on' or 'off' (got: '#{var_non_rotational}')"
+  end
+  if var_group == false || var_group.to_s.strip.empty?
+    # Keep VirtualBox groups opt-in. Setting a group moves the VM directory on
+    # the host and stale paths from interrupted imports can make `modifyvm
+    # --groups` fail before the guest even boots.
+    var_group = nil
+  else
+    var_group = var_group.to_s
+    var_group = "/#{var_group}" unless var_group.start_with?('/')
+  end
+  var_asm_disk_path = var_asm_disk_path.to_s.empty? ? './' : "#{var_asm_disk_path}/"
+  var_vm1_u01_disk  = './node1_u01.vdi' if var_vm1_u01_disk.to_s.empty?
+  var_vm2_u01_disk  = './node2_u01.vdi' if var_vm2_u01_disk.to_s.empty?
+end
+
+# --------------------------- Required Vagrant plugins ------------------------
+required_plugins = ['vagrant-reload', 'vagrant-proxyconf']
+required_plugins << 'vagrant-libvirt' if var_provider_name == 'libvirt'
+
+required_plugins.each do |plugin|
+  unless Vagrant.has_plugin?(plugin)
+    puts "Installing missing Vagrant plugin: #{plugin}"
+    unless system("vagrant plugin install #{plugin}")
+      fatal "failed to install Vagrant plugin '#{plugin}'"
+    end
+  end
+end
+
+# --------------------------- Time zone ---------------------------------------
+offset_sec = Time.now.gmt_offset
+if (offset_sec % 3600) == 0
+  offset_hr       = offset_sec / 3600
+  timezone_suffix = offset_hr >= 0 ? "-#{offset_hr}" : "+#{-offset_hr}"
+  var_system_timezone = "Etc/GMT#{timezone_suffix}"
+else
+  var_system_timezone = 'UTC'
+end
+
+# --------------------------- VM definition -----------------------------------
+Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
+  config.vm.box              = BOX_NAME
+  config.vm.box_url          = BOX_URL
+  config.vm.box_check_update = false
+  config.vm.box_version      = BOX_MIN_VERSION if var_provider_name == 'virtualbox'
+
+  config.vbguest.auto_update = false if Vagrant.has_plugin?('vagrant-vbguest')
+
+  # Proxy configuration pulled from host environment (optional).
+  if Vagrant.has_plugin?('vagrant-proxyconf')
+    config.proxy.http     = ENV['http_proxy']  if ENV['http_proxy']
+    config.proxy.https    = ENV['https_proxy'] if ENV['https_proxy']
+    config.proxy.no_proxy = ENV['no_proxy']    if ENV['no_proxy']
+  end
+
+  if var_provider_name == 'libvirt'
+    # The provisioner expects the project tree to be mounted at /vagrant.
+    config.vm.synced_folder '.', '/vagrant', type: 'nfs'
+  end
+
+  # -------------------- libvirt --------------------
+  if var_provider_name == 'libvirt'
+    nodes = []
+    unless ORESTART == true
+      nodes << [:host2, var_vm2_name, var_vm2_mem_size, var_vm2_cpus,
+                var_vm2_public_ip, var_vm2_private_ip, var_vm2_storage]
+    end
+    nodes << [:host1, var_vm1_name, var_vm1_mem_size, var_vm1_cpus,
+              var_vm1_public_ip, var_vm1_private_ip, var_vm1_storage]
+
+    nodes.each do |vm_sym, vm_name, mem_size, cpus, public_ip, private_ip, vm_storage|
+      config.vm.define vm_sym, primary: (vm_sym == :host1) do |node|
+        node.vm.hostname = vm_name
+        node.vm.network 'private_network', libvirt__network_name: 'vgt-hostonly_network', ip: public_ip
+        node.vm.network 'private_network', libvirt__network_name: 'vgt-private_network',  ip: private_ip
+        node.vm.provider :libvirt do |libvirt|
+          libvirt.default_prefix    = var_prefix_name.end_with?('-') ? var_prefix_name : "#{var_prefix_name}-"
+          libvirt.driver            = 'kvm'
+          libvirt.memory            = mem_size
+          libvirt.cpus              = cpus
+          libvirt.graphics_type     = 'none'
+          libvirt.storage_pool_name = vm_storage
+
+          # u01 disk
+          libvirt.storage :file, size: '100G'
+
+          # shared ASM disks
+          libvirt.storage_pool_name = var_asm_storage
+          var_asm_disk_num.times do |i|
+            libvirt.storage :file,
+                            path:      "#{var_prefix_name}_asm_#{i}",
+                            size:      "#{var_asm_disk_size}G",
+                            cache:     'none',
+                            type:      'raw',
+                            serial:    "asm_disk_#{i + 1}",
+                            shareable: 'true',
+                            allow_existing: 'true'
+          end
+        end
+      end
+    end
+  end
+
+  # -------------------- virtualbox -----------------
+  if var_provider_name == 'virtualbox'
+    unless ORESTART == true
+      # In clustered mode, host2 only runs the common setup stages and owns the
+      # initial ASM disk partitioning. Defining it first keeps plain
+      # `vagrant up` working without requiring `--parallel`.
+      vb_specs = [
+        [:host2, var_vm2_name, var_vm2_mem_size, var_vm2_cpus,
+         var_vm2_public_ip, var_vm2_private_ip, var_vm2_u01_disk, true],
+        [:host1, var_vm1_name, var_vm1_mem_size, var_vm1_cpus,
+         var_vm1_public_ip, var_vm1_private_ip, var_vm1_u01_disk, false]
+      ]
+    else
+      vb_specs = [
+        [:host1, var_vm1_name, var_vm1_mem_size, var_vm1_cpus,
+         var_vm1_public_ip, var_vm1_private_ip, var_vm1_u01_disk, true]
+      ]
+    end
+
+    vb_specs.each do |vm_sym, vm_name, mem_size, cpus, public_ip, private_ip, u01_disk, creates_asm_disks|
+      config.vm.define vm_sym, primary: (vm_sym == :host1) do |node|
+        node.vm.hostname = vm_name
+        node.vm.network :private_network, ip: public_ip,  virtualbox__hostonly: 'vboxnet0'
+        node.vm.network :private_network, ip: private_ip, virtualbox__intnet:   'private'
+
+        node.vm.provider :virtualbox do |vb|
+          vb.name   = "#{var_prefix_name}-#{vm_name}"
+          vb.memory = mem_size
+          vb.cpus   = cpus
+          vb.customize ['modifyvm', :id, '--groups', var_group] unless var_group.nil?
+
+          # Mark existing box disks non-rotational
+          (0...box_disks_num).each do |port|
+            vb.customize ['storageattach', :id,
+                          '--storagectl', 'SATA Controller',
+                          '--port', port,
+                          '--nonrotational', var_non_rotational]
+          end
+
+          disk_port = box_disks_num
+
+          # u01 disk (per-node, persistent)
+          unless File.exist?(u01_disk)
+            vb.customize ['createhd', '--filename', u01_disk, '--size', 100 * 1024]
+          end
+          vb.customize ['storageattach', :id,
+                        '--storagectl', 'SATA Controller',
+                        '--port', disk_port, '--device', 0,
+                        '--type', 'hdd', '--medium', u01_disk,
+                        '--nonrotational', var_non_rotational]
+          disk_port += 1
+
+          # Shared ASM disks — create once on the first cluster node that
+          # Vagrant brings up for this provider, then reuse everywhere.
+          var_asm_disk_num.times do |i|
+            asm_disk = "#{var_asm_disk_path}asm_disk#{i}.vdi"
+            if creates_asm_disks && !File.exist?(asm_disk)
+              vb.customize ['createhd',
+                            '--filename', asm_disk,
+                            '--size', var_asm_disk_size * 1024,
+                            '--format', 'VDI',
+                            '--variant', 'Fixed']
+            end
+            if File.exist?(asm_disk)
+              vb.customize ['modifymedium', 'disk', asm_disk, '--type', 'shareable']
+            end
+            vb.customize ['storageattach', :id,
+                          '--storagectl', 'SATA Controller',
+                          '--port', disk_port, '--device', 0,
+                          '--type', 'hdd', '--medium', asm_disk,
+                          '--mtype', 'shareable',
+                          '--nonrotational', var_non_rotational]
+            disk_port += 1
+          end
+        end
+      end
+    end
+  end
+
+  # -------------------- Common provisioning --------------------
+  # Enable SSH password auth (lab-internal only; Vagrant's synced folders and
+  # ssh equivalence setup need it during provisioning).
+  config.vm.provision 'shell', name: 'enable-ssh-password-auth', inline: <<~SHELL
+    set -euo pipefail
+    sed -ri 's/^[# ]*PasswordAuthentication[[:space:]]+.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+    systemctl restart sshd
+  SHELL
+
+  # Main orchestration — all knobs are passed explicitly via env (nothing from
+  # the VM's shell environment bleeds in).
+  config.vm.provision 'shell', name: 'oracle-rac-setup', path: 'scripts/setup.sh', env: {
+    'PROVIDER'         => var_provider_name,
+    'BOX_DISK_NUM'     => box_disks_num.to_s,
+    'SYSTEM_TIMEZONE'  => var_system_timezone,
+    'PREFIX_NAME'      => var_prefix_name,
+    'VM1_NAME'         => var_vm1_name,
+    'VM2_NAME'         => var_vm2_name,
+    'DOMAIN'           => var_domain,
+    'NODE1_PUBLIC_IP'  => var_vm1_public_ip,
+    'NODE2_PUBLIC_IP'  => var_vm2_public_ip,
+    'NODE1_VIP_IP'     => var_vm1_vip_ip,
+    'NODE2_VIP_IP'     => var_vm2_vip_ip,
+    'NODE1_PRIV_IP'    => var_vm1_private_ip,
+    'NODE2_PRIV_IP'    => var_vm2_private_ip,
+    'SCAN_IP1'         => var_scan_ip1,
+    'SCAN_IP2'         => var_scan_ip2,
+    'SCAN_IP3'         => var_scan_ip3,
+    'GI_SOFTWARE'      => var_gi_software,
+    'DB_SOFTWARE'      => var_db_software,
+    'OPATCH_SOFTWARE'  => var_opatch_software,
+    'GI_RU_SOFTWARE'   => var_gi_ru_software,
+    'GI_VERSION'       => GI_VERSION,
+    'DB_VERSION'       => DB_VERSION,
+    'DB_MAJOR'         => DB_MAJOR,
+    'ORA_LANGUAGES'    => var_ora_languages,
+    'P1_RATIO'         => var_p1_ratio.to_s,
+    'ASM_DISK_NUM'     => var_asm_disk_num.to_s,
+    'NOMGMTDB'         => NOMGMTDB.to_s,
+    'ORESTART'         => ORESTART.to_s,
+    'DB_NAME'          => var_db_name,
+    'PDB_NAME'         => var_pdb_name,
+    'CDB'              => var_cdb.to_s,
+    'ROOT_PASSWORD'    => var_root_password,
+    'GRID_PASSWORD'    => var_grid_password,
+    'ORACLE_PASSWORD'  => var_oracle_password,
+    'SYS_PASSWORD'     => var_sys_password,
+    'PDB_PASSWORD'     => var_pdb_password
+  }
+end
